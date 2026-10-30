@@ -1,7 +1,7 @@
 {
   "name": "memescope-backend",
   "version": "0.1.0",
-  "description": "Real-time Pump.fun data service (Phase 1)",
+  "description": "Real-time Pump.fun data service (Phase 1 + on-chain analysis)",
   "type": "module",
   "main": "server.js",
   "scripts": {
@@ -11,6 +11,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.22.0"
   }
 }

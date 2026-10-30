@@ -1,4 +1,4 @@
-// MemeScope backend - Phase 1
+// MemeScope backend - Phase 1 + on-chain analysis (bundled wallets, creator history)
 // Listens to Pump.fun launches and trades (via PumpPortal), calculates metrics,
 // and serves them to the website through REST + WebSocket.
 // Everything is kept in memory (no database needed yet). See docs/api-contract.md.
@@ -7,6 +7,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
+import { analyzeLaunch, creatorLaunches, chainStats, onchainEnabled, onchainCapped, dailyCap, CapError } from './onchain.js';
 
 // ---------------------------------------------------------------- settings
 const PORT = Number(process.env.PORT) || 3000;
@@ -37,6 +38,7 @@ const DEX_POLL_MS = 20_000;
 const DEX_BATCH = 30; // addresses per request
 const DEX_BATCHES_PER_CYCLE = 10; // = max 30 requests/min
 const DEX_MAX_AGE_MS = 3 * 3600 * 1000; // only coins younger than 3h
+const GRAD_MIN_LIQ_USD = 10_000; // a PumpSwap pool needs at least this much liquidity to count as graduated
 
 // Saved state (survives restarts if DATA_DIR is on a persistent disk)
 const DATA_DIR = process.env.DATA_DIR || './data';
@@ -178,6 +180,7 @@ function makeToken(o, now) {
     extCheckedAt: 0,
     idleVerified: Boolean(o.idleVerified),
     gradExt: Boolean(o.gradExt),
+    chain: o.chain && o.chain.status === 'done' ? o.chain : { status: 'idle' }, // on-chain launch analysis
     sum: null,
   };
 }
@@ -374,10 +377,9 @@ function buildSummary(t, now) {
   let sniperBal = 0;
   for (const a of t.snipers) sniperBal += t.wallets.get(a)?.bal ?? 0;
 
-  const notes = {
-    bundledPct: { status: 'calculating', reason: 'Needs on-chain wallet analysis (Phase 2)' },
-    riskScore: { status: 'calculating', reason: 'Risk engine arrives in Phase 3' },
-  };
+  const notes = { riskScore: { status: 'not_applicable', reason: 'This service does not score risk; the website shows the RugCheck report' } };
+  const bn = bundleNote(t);
+  if (bn) notes.bundledPct = bn;
   if (t.meta.status !== 'live') notes.metadata = { status: t.meta.status, reason: t.meta.reason };
   if (t.vTokens === null && !t.gradExt) notes.bondingProgress = { status: 'calculating', reason: 'Waiting for first curve data' };
   if (now - t.lastTradeAt > DEAD_AFTER_MS && !isVerified(t, now)) notes.activity = { status: 'calculating', reason: 'No live trade data for this coin right now, so activity is unverified (not marked dead)' };
@@ -407,12 +409,112 @@ function buildSummary(t, now) {
     top10Pct: round(t.top10Pct, 2),
     devHoldingPct: round((creatorBal / TOTAL_SUPPLY) * 100, 2),
     sniperPct: round((sniperBal / TOTAL_SUPPLY) * 100, 2),
+    bundledPct: t.chain.status === 'done' ? t.chain.bundledPct : null,
+    bundleWallets: t.chain.status === 'done' ? t.chain.bundleWallets : null,
     tradeCount: t.tradeCount,
     lastTradeAt: t.lastTradeAt,
     socials: { twitter: t.twitter, telegram: t.telegram, website: t.website },
     links: { pumpfun: 'https://pump.fun/coin/' + t.mint, solscan: 'https://solscan.io/token/' + t.mint },
     dataSource,
     notes,
+  };
+}
+
+// ---------------------------------------------------------------- on-chain launch analysis (bundled wallets)
+const CHAIN_MIN_AGE_MS = 20_000; // wait until the launch slot is confirmed
+const CHAIN_RETRY_MS = 2 * 60 * 1000;
+const chainQueue = [];
+
+function bundleNote(t) {
+  const c = t.chain;
+  if (c.status === 'done') return null;
+  if (!onchainEnabled()) return { status: 'not_applicable', reason: 'On-chain analysis is off (HELIUS_API_KEY not set)' };
+  if (c.status === 'queued' || c.status === 'running') return { status: 'calculating', reason: 'Checking launch-block wallets on-chain' };
+  if (c.status === 'error') return { status: 'error', reason: c.reason };
+  if (onchainCapped()) return { status: 'stale', reason: 'Daily on-chain analysis limit reached; resumes next UTC day' };
+  return { status: 'not_applicable', reason: 'Analyzed when a coin is opened or gains traction' };
+}
+
+// Only coins people look at or that gain traction are analyzed, to protect the Helius plan.
+function wantsChain(t, now, viewed = false) {
+  if (!onchainEnabled() || onchainCapped()) return false;
+  if (t.chain.status === 'done' || t.chain.status === 'queued' || t.chain.status === 'running') return false;
+  if (t.chain.status === 'error' && now - t.chain.at < CHAIN_RETRY_MS) return false;
+  if (now - t.createdAt < CHAIN_MIN_AGE_MS) return false;
+  if (viewed) return true;
+  const cats = t.sum?.categories || [];
+  return cats.includes('moving') || cats.includes('about_to_graduate') || t.ath >= t.initialMcap * 1.5 || t.tradeCount >= 20;
+}
+
+function queueChain(t, viewed = false) {
+  if (viewed) t.chainViewed = true; // remembered, so a coin opened in its first seconds is analyzed once old enough
+  if (!wantsChain(t, Date.now(), viewed || t.chainViewed)) return;
+  t.chain = { status: 'queued' };
+  if (viewed) chainQueue.unshift(t.mint);
+  else chainQueue.push(t.mint);
+  dirty.add(t.mint);
+}
+
+let chainRunning = 0;
+async function pumpChain() {
+  while (chainRunning < 2 && chainQueue.length) {
+    const t = tokens.get(chainQueue.shift());
+    if (!t || t.chain.status !== 'queued') continue;
+    chainRunning++;
+    t.chain = { status: 'running' };
+    analyzeLaunch(t.mint, t.creator)
+      .then((r) => (t.chain = { status: 'done', at: Date.now(), ...r }))
+      .catch((e) => (t.chain = e instanceof CapError ? { status: 'idle' } : { status: 'error', at: Date.now(), reason: 'On-chain check failed: ' + e.message }))
+      .finally(() => {
+        chainRunning--;
+        dirty.add(t.mint);
+        pumpChain();
+      });
+  }
+}
+setInterval(() => {
+  for (const t of tokens.values()) queueChain(t);
+  pumpChain();
+}, 5_000);
+
+// creator history cache (wallet|cursor -> result) so repeated page views do not spend RPC calls
+const creatorCache = new Map();
+async function creatorOnChain(wallet, cursor) {
+  const key = wallet + '|' + (cursor || '');
+  const hit = creatorCache.get(key);
+  if (hit && Date.now() - hit.at < 10 * 60 * 1000) return hit.value;
+  const value = creatorLaunches(wallet, cursor);
+  creatorCache.set(key, { at: Date.now(), value });
+  value.catch(() => creatorCache.delete(key));
+  if (creatorCache.size > 500) creatorCache.delete(creatorCache.keys().next().value);
+  return value;
+}
+
+async function creatorResponse(walletAddr, cursor) {
+  const seen = [...(byCreator.get(walletAddr) || [])].map((m) => tokens.get(m)?.sum).filter(Boolean);
+  let onChain;
+  if (!onchainEnabled()) onChain = { status: 'not_applicable', reason: 'On-chain history is off (HELIUS_API_KEY not set)', launches: [], scanned: 0, nextCursor: null };
+  else {
+    try {
+      const r = await creatorOnChain(walletAddr, cursor);
+      onChain = { status: 'live', reason: null, ...r };
+    } catch (e) {
+      onChain = { status: e instanceof CapError ? 'stale' : 'error', reason: e.message, launches: [], scanned: 0, nextCursor: null };
+    }
+  }
+  return {
+    wallet: walletAddr,
+    coinsSeen: seen.length,
+    ruggedCount: seen.filter((c) => c.status === 'rugged').length,
+    deadCount: seen.filter((c) => c.status === 'dead').length,
+    coins: seen.sort((a, b) => b.createdAt - a.createdAt).slice(0, 100),
+    onChain,
+    coverage: {
+      status: onChain.status === 'live' ? 'live' : onChain.status,
+      reason: onChain.status === 'live'
+        ? `Verified Pump.fun launches in the ${onChain.scanned} most recent wallet transactions loaded; use nextCursor for older history. Rugged/dead counts cover coins this server tracked.`
+        : onChain.reason,
+    },
   };
 }
 
@@ -697,7 +799,8 @@ function applyExt(t, p, now) {
     t.mcap = mcUsd / usd;
     if (t.mcap > t.ath) t.ath = t.mcap;
   }
-  if (typeof p.dexId === 'string' && /^(pumpswap|raydium|meteora|orca)/i.test(p.dexId)) t.gradExt = true;
+  // graduated = a real PumpSwap pool with real liquidity (anyone can create tiny pools for a coin on other DEXes, those are ignored)
+  if (p.dexId === 'pumpswap' && (num(p.liquidity?.usd) || 0) >= GRAD_MIN_LIQ_USD) t.gradExt = true;
   const m5Total = m5.buys + m5.sells;
   if (m5Total > 0) {
     t.idleVerified = false;
@@ -726,9 +829,13 @@ async function dexBatch(batch) {
   for (const p of arr) {
     const m = p?.baseToken?.address;
     if (!m) continue;
+    if (p.dexId !== 'pumpfun' && p.dexId !== 'pumpswap') continue; // ignore rogue pools on other DEXes
     const liq = num(p.liquidity?.usd) || 0;
+    if (p.dexId === 'pumpswap' && liq < GRAD_MIN_LIQ_USD) continue; // pre-graduation dust pool
+    // a real PumpSwap pool beats the bonding-curve pair
+    const rank = (p.dexId === 'pumpswap' ? 1e12 : 0) + liq;
     const cur = best.get(m);
-    if (!cur || liq > cur.liq) best.set(m, { p, liq });
+    if (!cur || rank > cur.liq) best.set(m, { p, liq: rank });
   }
   for (const t of batch) {
     t.extCheckedAt = now;
@@ -907,6 +1014,10 @@ function statusObject() {
     dailyTradeCap: DAILY_TRADE_CAP,
     streamedCoins: [...tokens.values()].filter((t) => t.subscribed).length,
     dexLastOkAt: stats.dexLastAt || null,
+    onchain: onchainEnabled() ? (onchainCapped() ? 'capped' : 'on') : 'no_key',
+    onchainCallsToday: chainStats.callsToday,
+    onchainDailyCap: dailyCap,
+    onchainErrors: chainStats.errors,
     serverTime: Date.now(),
   };
 }
@@ -1062,7 +1173,7 @@ const server = http.createServer((req, res) => {
   const notFound = (what) => sendJson(req, res, 404, { error: { code: 'not_found', message: what + ' not found' } });
 
   try {
-    if (!parts.length) return sendJson(req, res, 200, { name: 'memescope-backend', phase: 1, docs: 'See docs/api-contract.md', health: '/health' });
+    if (!parts.length) return sendJson(req, res, 200, { name: 'memescope-backend', phase: 2, docs: 'See docs/api-contract.md', health: '/health' });
     if (parts[0] === 'health') return sendJson(req, res, 200, { status: 'ok', ...statusObject() });
     if (parts[0] === 'sol-price') return sendJson(req, res, 200, solPrice);
 
@@ -1072,6 +1183,8 @@ const server = http.createServer((req, res) => {
       const t = tokens.get(parts[1]);
       if (!t) return notFound('Coin');
       if (parts.length === 2) {
+        queueChain(t, true);
+        pumpChain();
         const others = [...(byCreator.get(t.creator) || [])].filter((m) => m !== t.mint).map((m) => tokens.get(m)?.sum).filter(Boolean);
         return sendJson(req, res, 200, { ...t.sum, description: t.description, uri: t.uri, creatorOtherCoins: others.slice(0, 50) });
       }
@@ -1097,17 +1210,16 @@ const server = http.createServer((req, res) => {
     }
 
     if (parts[0] === 'creators' && parts.length === 2) {
-      const mints = [...(byCreator.get(parts[1]) || [])];
-      const coins = mints.map((m) => tokens.get(m)?.sum).filter(Boolean);
-      if (!coins.length) return notFound('Creator');
-      return sendJson(req, res, 200, {
-        wallet: parts[1],
-        coinsSeen: coins.length,
-        ruggedCount: coins.filter((c) => c.status === 'rugged').length,
-        deadCount: coins.filter((c) => c.status === 'dead').length,
-        coins: coins.sort((a, b) => b.createdAt - a.createdAt).slice(0, 100),
-        coverage: { status: 'calculating', reason: 'Only coins launched since this server started. Full on-chain history arrives in Phase 3.' },
-      });
+      if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(parts[1])) return sendJson(req, res, 400, { error: { code: 'bad_wallet', message: 'Not a Solana address' } });
+      const cursor = q.get('cursor');
+      if (cursor && !/^[1-9A-HJ-NP-Za-km-z]{64,100}$/.test(cursor)) return sendJson(req, res, 400, { error: { code: 'bad_cursor', message: 'Bad cursor' } });
+      creatorResponse(parts[1], cursor)
+        .then((body) => sendJson(req, res, 200, body))
+        .catch((e) => {
+          console.error('[creators] error', e);
+          sendJson(req, res, 500, { error: { code: 'internal', message: 'Something went wrong' } });
+        });
+      return;
     }
 
     if (parts[0] === 'search') {
@@ -1165,6 +1277,8 @@ wss.on('connection', (ws) => {
         if (!t) return safeSend(c, { type: 'error', message: 'Unknown coin', mint: m.mint });
         c.coins.add(m.mint);
         ensureSubscribed(t); // coins a visitor is watching get live trades
+        queueChain(t, true);
+        pumpChain();
         safeSend(c, { type: 'coin_snapshot', coin: t.sum, trades: [...t.trades].reverse().slice(0, 50), holders: holdersList(t, 20) });
       }
     } else if (m.type === 'unsubscribe') {
@@ -1200,9 +1314,10 @@ function stateJson() {
       image: t.image, description: t.description, twitter: t.twitter, telegram: t.telegram, website: t.website,
       metaLive: t.meta.status === 'live', mcap: t.mcap, initialMcap: t.initialMcap, ath: t.ath, vTokens: t.vTokens, vSol: t.vSol,
       lastTradeAt: t.lastTradeAt, tradeCount: t.tradeCount, creatorMax: t.creatorMax, gradExt: t.gradExt, idleVerified: t.idleVerified,
+      chain: t.chain.status === 'done' ? t.chain : undefined,
       slots: t.slots.slice(-SAVE_MAX_SLOTS).map((x) => [x.k, r4(x.o), r4(x.h), r4(x.l), r4(x.c), x.b, x.s, r4(x.v)]),
     }));
-  return JSON.stringify({ v: 1, savedAt: Date.now(), day: stats.day, tradesToday: stats.tradesToday, solPrice, tokens: list });
+  return JSON.stringify({ v: 1, savedAt: Date.now(), day: stats.day, tradesToday: stats.tradesToday, onchainCallsToday: chainStats.callsToday, solPrice, tokens: list });
 }
 
 let saving = false;
@@ -1243,6 +1358,7 @@ function loadState() {
   const now = Date.now();
   if (j.day === stats.day && Number.isFinite(j.tradesToday)) {
     stats.tradesToday = j.tradesToday; // so a restart does not reset the daily cost cap
+    if (Number.isFinite(j.onchainCallsToday)) chainStats.callsToday = j.onchainCallsToday;
     if (stats.tradesToday >= DAILY_TRADE_CAP) stats.capped = true;
   }
   if (j.solPrice && j.solPrice.usd) solPrice = { ...j.solPrice, status: 'stale', reason: 'Restored from last run, refreshing' };
