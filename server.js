@@ -4,6 +4,8 @@
 // Everything is kept in memory (no database needed yet). See docs/api-contract.md.
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 
 // ---------------------------------------------------------------- settings
@@ -20,7 +22,28 @@ const TRADE_KEEP = 200; // last trades kept per token
 const SNIPER_MS = 3_000; // buys within 3s of launch count as "sniper"
 const MAX_TOKENS = 15_000;
 const TOKEN_TTL_MS = 6 * 3600 * 1000; // forget tokens after 6h
-const UNSUB_AFTER_MS = 30 * 60 * 1000; // stop following a token after 30 min without trades
+const IDLE_UNSUB_MS = 3 * 60 * 1000; // stop streaming trades for a coin after 3 min without trades
+const ACTIVE_MAX_AGE_MS = 30 * 60 * 1000; // ...and after 30 min of age, unless it is watched or moving
+const DEAD_AFTER_MS = 10 * 60 * 1000; // "dead" needs 10 min without trades AND verified data
+
+// PumpPortal trade streams need a funded API key (set PUMPPORTAL_API_KEY on Render).
+const API_KEY = process.env.PUMPPORTAL_API_KEY || '';
+const FORCE_SUBSCRIBE = process.env.FORCE_TRADE_SUBSCRIBE === '1'; // try trade streams even without a key
+const DAILY_TRADE_CAP = Number(process.env.DAILY_TRADE_CAP) || 50_000; // max streamed trades per UTC day (cost control)
+
+// DEX Screener fallback for coins whose trades are not streamed (free, rate limited)
+const DEX_URL = process.env.DEXSCREENER_URL || 'https://api.dexscreener.com';
+const DEX_POLL_MS = 20_000;
+const DEX_BATCH = 30; // addresses per request
+const DEX_BATCHES_PER_CYCLE = 10; // = max 30 requests/min
+const DEX_MAX_AGE_MS = 3 * 3600 * 1000; // only coins younger than 3h
+
+// Saved state (survives restarts if DATA_DIR is on a persistent disk)
+const DATA_DIR = process.env.DATA_DIR || './data';
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
+const SAVE_MS = 60_000;
+const SAVE_MAX_TOKENS = 3000;
+const SAVE_MAX_SLOTS = 180; // 30 min of 10s slots
 const FLUSH_MS = 300; // how often updates are pushed to browsers
 const FULL_REFRESH_MS = 5_000; // how often time-based fields are recalculated
 
@@ -34,8 +57,8 @@ const clients = new Set(); // connected browsers
 const subQueue = new Set(); // mints waiting for a trade subscription
 const startedAt = Date.now();
 
-let solPrice = { usd: null, sek: null, eur: null, updatedAt: 0, status: 'calculating', reason: 'Waiting for first price' };
-const stats = { upstream: 'connecting', events: 0, eventsPerSec: 0, lastUpstreamMsg: 0, otherLogged: 0 };
+let solPrice = { usd: null, sek: null, eur: null, updatedAt: 0, status: 'calculating', reason: 'Waiting for first price', source: null };
+const stats = { upstream: 'connecting', events: 0, eventsPerSec: 0, lastUpstreamMsg: 0, otherLogged: 0, tradesToday: 0, day: new Date().toISOString().slice(0, 10), capped: false, dexOk: 0, dexLastAt: 0 };
 
 // ---------------------------------------------------------------- helpers
 const num = (v) => {
@@ -89,43 +112,102 @@ function addToSlot(t, now, side, sol) {
   s.v += sol;
 }
 
-function onCreate(d) {
-  if (!d.mint || tokens.has(d.mint)) return;
-  if (tokens.size >= MAX_TOKENS) housekeeping(true);
-  const now = Date.now();
-  const mcap = num(d.marketCapSol) || 0;
-  const t = {
-    mint: d.mint,
-    name: String(d.name || '').slice(0, 100),
-    symbol: String(d.symbol || '').slice(0, 40),
-    uri: d.uri || null,
-    creator: d.traderPublicKey || null,
-    createdAt: now,
-    image: ipfsToHttp(d.imageUri) || null,
-    description: null,
-    twitter: null,
-    telegram: null,
-    website: null,
-    meta: { status: d.uri ? 'calculating' : 'not_applicable', reason: d.uri ? 'Fetching token metadata' : 'Token has no metadata link', tries: 0 },
+// ---- trade stream state
+function streamWanted() {
+  return !stats.capped && (Boolean(API_KEY) || FORCE_SUBSCRIBE);
+}
+function tradeStreamState() {
+  if (stats.capped) return 'capped';
+  if (!API_KEY && !FORCE_SUBSCRIBE) return 'no_key';
+  if (stats.upstream !== 'connected') return 'connecting';
+  return 'live';
+}
+const streamOn = () => tradeStreamState() === 'live';
+
+function ensureSubscribed(t) {
+  if (t.subscribed || !streamWanted()) return;
+  t.subscribed = true;
+  t.idleVerified = false;
+  subQueue.add(t.mint);
+}
+
+// true when we really know whether the coin is trading or not (live stream, a verified idle period, or fresh DEX Screener data)
+function isVerified(t, now) {
+  return t.idleVerified || (t.subscribed && streamOn()) || Boolean(t.ext && now - t.ext.at < 120_000);
+}
+
+function usingExt(t, now) {
+  return Boolean(t.ext && now - t.ext.at < 90_000 && !(t.subscribed && streamOn()));
+}
+
+function makeToken(o, now) {
+  const mcap = o.mcap || 0;
+  return {
+    mint: o.mint,
+    name: String(o.name || '').slice(0, 100),
+    symbol: String(o.symbol || '').slice(0, 40),
+    uri: o.uri || null,
+    creator: o.creator || null,
+    createdAt: o.createdAt ?? now,
+    image: o.image || null,
+    description: o.description || null,
+    twitter: o.twitter || null,
+    telegram: o.telegram || null,
+    website: o.website || null,
+    meta: o.metaLive
+      ? { status: 'live', reason: null, tries: 0 }
+      : { status: o.uri ? 'calculating' : 'not_applicable', reason: o.uri ? 'Fetching token metadata' : 'Token has no metadata link', tries: 0 },
     mcap,
-    initialMcap: mcap,
-    ath: mcap,
-    vTokens: num(d.vTokensInBondingCurve),
-    vSol: num(d.vSolInBondingCurve),
-    lastTradeAt: now,
-    tradeCount: 0,
-    slots: [],
+    initialMcap: o.initialMcap ?? mcap,
+    ath: o.ath ?? mcap,
+    vTokens: o.vTokens ?? null,
+    vSol: o.vSol ?? null,
+    lastTradeAt: o.lastTradeAt ?? now,
+    tradeCount: o.tradeCount || 0,
+    slots: o.slots || [],
     trades: [],
     wallets: new Map(),
     holderCount: 0,
     snipers: new Set(),
-    creatorMax: 0,
+    creatorMax: o.creatorMax || 0,
     top10Pct: 0,
     top10At: 0,
     holdersDirty: true,
-    subscribed: true,
+    subscribed: false,
+    ext: null, // latest DEX Screener data (fallback when trades are not streamed)
+    extCheckedAt: 0,
+    idleVerified: Boolean(o.idleVerified),
+    gradExt: Boolean(o.gradExt),
     sum: null,
   };
+}
+
+function registerToken(t) {
+  tokens.set(t.mint, t);
+  if (t.creator) {
+    if (!byCreator.has(t.creator)) byCreator.set(t.creator, new Set());
+    byCreator.get(t.creator).add(t.mint);
+  }
+}
+
+function onCreate(d) {
+  if (!d.mint || tokens.has(d.mint)) return;
+  if (tokens.size >= MAX_TOKENS) housekeeping(true);
+  const now = Date.now();
+  const t = makeToken(
+    {
+      mint: d.mint,
+      name: d.name,
+      symbol: d.symbol,
+      uri: d.uri,
+      creator: d.traderPublicKey,
+      image: ipfsToHttp(d.imageUri),
+      mcap: num(d.marketCapSol) || 0,
+      vTokens: num(d.vTokensInBondingCurve),
+      vSol: num(d.vSolInBondingCurve),
+    },
+    now,
+  );
   // creator's own first buy
   const initialBuy = num(d.initialBuy);
   if (t.creator && initialBuy && initialBuy > 0) {
@@ -135,14 +217,10 @@ function onCreate(d) {
     setBalance(t, w, initialBuy);
     t.creatorMax = initialBuy;
   }
-  tokens.set(t.mint, t);
-  if (t.creator) {
-    if (!byCreator.has(t.creator)) byCreator.set(t.creator, new Set());
-    byCreator.get(t.creator).add(t.mint);
-  }
+  registerToken(t);
   t.sum = buildSummary(t, now);
   newCoins.push(t.mint);
-  subQueue.add(t.mint);
+  ensureSubscribed(t); // only streams trades if a key is set and the daily cap is not reached
   if (t.uri) enqueueMeta(t);
 }
 
@@ -163,6 +241,7 @@ function onTrade(d) {
   if (vt !== null) t.vTokens = vt;
   if (vs !== null) t.vSol = vs;
   t.lastTradeAt = now;
+  t.idleVerified = false;
   t.tradeCount++;
   addToSlot(t, now, side, sol);
 
@@ -234,6 +313,7 @@ function mcapAgo(t, now, ms) {
 }
 
 function progress(t) {
+  if (t.gradExt) return 1; // DEX Screener lists the coin on a DEX (it has left the bonding curve)
   if (t.vTokens === null) return 0;
   return clamp((INIT_VIRTUAL_TOKENS - t.vTokens) / CURVE_TOKENS, 0, 1);
 }
@@ -261,7 +341,7 @@ function categoriesFor(t, now, win, prog, changeM5) {
   const cats = [];
   if (prog >= 1) cats.push('graduated');
   if (rugged) cats.push('rugged');
-  if (idle > 10 * 60 * 1000 && !rugged && prog < 1) cats.push('dead');
+  if (idle > DEAD_AFTER_MS && isVerified(t, now) && !rugged && prog < 1) cats.push('dead'); // never 'dead' without real data
   if (prog >= 0.8 && prog < 1 && !rugged) cats.push('about_to_graduate');
   if (age < 5 * 60 * 1000) cats.push('new');
   const trades1m = win.tx.m1.buys + win.tx.m1.sells;
@@ -275,8 +355,20 @@ function categoriesFor(t, now, win, prog, changeM5) {
 function buildSummary(t, now) {
   refreshHolders(t, now);
   const win = windowStats(t, now);
+  const useExt = usingExt(t, now);
+  if (useExt) {
+    // trades are not streamed for this coin: use DEX Screener numbers for 5m/1h windows
+    const usd = solPrice.usd;
+    const toSol = (v) => (usd ? (v || 0) / usd : 0);
+    win.vol.m5 = toSol(t.ext.volM5Usd);
+    win.vol.h1 = toSol(t.ext.volH1Usd);
+    win.tx.m5 = { ...t.ext.m5 };
+    win.tx.h1 = { ...t.ext.h1 };
+  }
   const prog = progress(t);
-  const changeM5 = pct(t.mcap, mcapAgo(t, now, 5 * 60 * 1000));
+  const changeM5 = useExt && t.ext.chM5 !== null ? t.ext.chM5 : pct(t.mcap, mcapAgo(t, now, 5 * 60 * 1000));
+  const changeH1 = useExt && t.ext.chH1 !== null ? t.ext.chH1 : pct(t.mcap, mcapAgo(t, now, 3600 * 1000));
+  const dataSource = t.subscribed && streamOn() ? 'stream' : useExt ? 'dexscreener' : t.tradeCount > 0 ? 'stream_stale' : 'launch_only';
   const { cats, status } = categoriesFor(t, now, win, prog, changeM5);
   const creatorBal = t.creator ? t.wallets.get(t.creator)?.bal ?? 0 : 0;
   let sniperBal = 0;
@@ -287,7 +379,8 @@ function buildSummary(t, now) {
     riskScore: { status: 'calculating', reason: 'Risk engine arrives in Phase 3' },
   };
   if (t.meta.status !== 'live') notes.metadata = { status: t.meta.status, reason: t.meta.reason };
-  if (t.vTokens === null) notes.bondingProgress = { status: 'calculating', reason: 'Waiting for first curve data' };
+  if (t.vTokens === null && !t.gradExt) notes.bondingProgress = { status: 'calculating', reason: 'Waiting for first curve data' };
+  if (now - t.lastTradeAt > DEAD_AFTER_MS && !isVerified(t, now)) notes.activity = { status: 'calculating', reason: 'No live trade data for this coin right now, so activity is unverified (not marked dead)' };
 
   return {
     mint: t.mint,
@@ -308,7 +401,7 @@ function buildSummary(t, now) {
     changePct: {
       m1: round(pct(t.mcap, mcapAgo(t, now, 60 * 1000)), 2),
       m5: round(changeM5, 2),
-      h1: round(pct(t.mcap, mcapAgo(t, now, 3600 * 1000)), 2),
+      h1: round(changeH1, 2),
     },
     holders: t.holderCount,
     top10Pct: round(t.top10Pct, 2),
@@ -318,6 +411,7 @@ function buildSummary(t, now) {
     lastTradeAt: t.lastTradeAt,
     socials: { twitter: t.twitter, telegram: t.telegram, website: t.website },
     links: { pumpfun: 'https://pump.fun/coin/' + t.mint, solscan: 'https://solscan.io/token/' + t.mint },
+    dataSource,
     notes,
   };
 }
@@ -387,18 +481,96 @@ async function fetchMeta(t) {
 }
 
 // ---------------------------------------------------------------- SOL price
-async function pollSolPrice() {
+async function fetchJson(url, ms = 7000) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
   try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,sek,eur');
+    const res = await fetch(url, { signal: ctl.signal, headers: { accept: 'application/json' } });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    const j = await res.json();
-    const s = j.solana;
-    if (!s || !s.usd) throw new Error('bad response');
-    solPrice = { usd: s.usd, sek: s.sek ?? null, eur: s.eur ?? null, updatedAt: Date.now(), status: 'live', reason: null };
-    broadcast({ type: 'sol_price', ...solPrice });
-  } catch (e) {
-    if (solPrice.updatedAt) solPrice = { ...solPrice, status: 'stale', reason: 'Price source temporarily unreachable' };
-    else solPrice = { ...solPrice, status: 'error', reason: 'Could not fetch SOL price: ' + e.message };
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Tried in order. The first one that answers wins, so one provider being down does not break the price.
+const PRICE_SOURCES = [
+  {
+    name: 'coinbase',
+    run: async () => {
+      const j = await fetchJson('https://api.coinbase.com/v2/prices/SOL-USD/spot');
+      const usd = Number(j?.data?.amount);
+      if (!(usd > 0)) throw new Error('bad response');
+      let sek = null;
+      let eur = null;
+      try {
+        const r = await fetchJson('https://api.coinbase.com/v2/exchange-rates?currency=USD');
+        const sekRate = Number(r?.data?.rates?.SEK);
+        const eurRate = Number(r?.data?.rates?.EUR);
+        if (sekRate > 0) sek = usd * sekRate;
+        if (eurRate > 0) eur = usd * eurRate;
+      } catch {}
+      return { usd, sek, eur };
+    },
+  },
+  {
+    name: 'coingecko',
+    run: async () => {
+      const j = await fetchJson('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd,sek,eur');
+      const s = j?.solana;
+      if (!s || !(s.usd > 0)) throw new Error('bad response');
+      return { usd: s.usd, sek: s.sek ?? null, eur: s.eur ?? null };
+    },
+  },
+  {
+    name: 'kraken',
+    run: async () => {
+      const j = await fetchJson('https://api.kraken.com/0/public/Ticker?pair=SOLUSD');
+      const first = j?.result && Object.values(j.result)[0];
+      const usd = Number(first?.c?.[0]);
+      if (!(usd > 0)) throw new Error('bad response');
+      return { usd, sek: null, eur: null };
+    },
+  },
+  {
+    name: 'dexscreener',
+    run: async () => {
+      const arr = await fetchJson(DEX_URL + '/tokens/v1/solana/So11111111111111111111111111111111111111112');
+      if (!Array.isArray(arr) || !arr.length) throw new Error('bad response');
+      const best = arr.slice().sort((a, b) => (num(b.liquidity?.usd) || 0) - (num(a.liquidity?.usd) || 0))[0];
+      const usd = Number(best?.priceUsd);
+      if (!(usd > 0)) throw new Error('bad response');
+      return { usd, sek: null, eur: null };
+    },
+  },
+];
+
+async function pollSolPrice() {
+  const errors = [];
+  for (const src of PRICE_SOURCES) {
+    try {
+      const p = await src.run();
+      let { usd, sek, eur } = p;
+      // sources that only give USD: reuse the last known SEK/EUR exchange rate
+      if (sek === null && solPrice.sek && solPrice.usd) sek = usd * (solPrice.sek / solPrice.usd);
+      if (eur === null && solPrice.eur && solPrice.usd) eur = usd * (solPrice.eur / solPrice.usd);
+      solPrice = { usd, sek, eur, updatedAt: Date.now(), status: 'live', reason: null, source: src.name };
+      broadcast({ type: 'sol_price', ...solPrice });
+      return;
+    } catch (e) {
+      errors.push(src.name + ': ' + (e.name === 'AbortError' ? 'timeout' : e.message));
+    }
+  }
+  console.warn('[sol-price] all sources failed:', errors.join(' | '));
+  const age = Date.now() - solPrice.updatedAt;
+  if (solPrice.updatedAt) {
+    // a single failed round is fine; only call it stale after 2 minutes
+    if (age > 120_000 && solPrice.status !== 'stale') {
+      solPrice = { ...solPrice, status: 'stale', reason: 'All price sources unreachable' };
+      broadcast({ type: 'sol_price', ...solPrice });
+    }
+  } else {
+    solPrice = { ...solPrice, status: 'error', reason: 'Could not fetch SOL price from any source' };
   }
 }
 
@@ -406,22 +578,59 @@ async function pollSolPrice() {
 let up = null;
 let upBackoff = 1000;
 
+function upstreamUrl() {
+  if (!API_KEY) return PUMP_WS_URL;
+  return PUMP_WS_URL + (PUMP_WS_URL.includes('?') ? '&' : '?') + 'api-key=' + encodeURIComponent(API_KEY);
+}
+
 function sendUp(obj) {
   if (up && up.readyState === WebSocket.OPEN) up.send(JSON.stringify(obj));
 }
 
+function rollDay() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d === stats.day) return;
+  stats.day = d;
+  stats.tradesToday = 0;
+  if (stats.capped) {
+    stats.capped = false;
+    console.log('[cap] new UTC day, trade streaming re-enabled');
+    const now = Date.now();
+    for (const t of tokens.values()) if (now - t.lastTradeAt < IDLE_UNSUB_MS && now - t.createdAt < ACTIVE_MAX_AGE_MS) ensureSubscribed(t);
+  }
+}
+
+function countTrade() {
+  rollDay();
+  stats.tradesToday++;
+  if (!stats.capped && stats.tradesToday >= DAILY_TRADE_CAP) {
+    stats.capped = true;
+    console.warn('[cap] daily trade cap reached (' + DAILY_TRADE_CAP + '), stopping trade streams until next UTC day. DEX Screener fallback takes over.');
+    const mints = [];
+    for (const t of tokens.values()) {
+      if (t.subscribed) {
+        t.subscribed = false;
+        mints.push(t.mint);
+      }
+    }
+    subQueue.clear();
+    for (let i = 0; i < mints.length; i += 100) sendUp({ method: 'unsubscribeTokenTrade', keys: mints.slice(i, i + 100) });
+  }
+}
+
 function connectUpstream() {
   stats.upstream = 'connecting';
-  up = new WebSocket(PUMP_WS_URL);
+  up = new WebSocket(upstreamUrl());
   up.on('open', () => {
     stats.upstream = 'connected';
     stats.lastUpstreamMsg = Date.now();
     upBackoff = 1000;
-    console.log('[upstream] connected');
+    console.log('[upstream] connected (trade stream: ' + tradeStreamState() + ')');
     sendUp({ method: 'subscribeNewToken' });
-    const now = Date.now();
-    const active = [...tokens.values()].filter((t) => t.subscribed && now - t.lastTradeAt < UNSUB_AFTER_MS).map((t) => t.mint);
-    for (let i = 0; i < active.length; i += 100) sendUp({ method: 'subscribeTokenTrade', keys: active.slice(i, i + 100) });
+    if (streamWanted()) {
+      const active = [...tokens.values()].filter((t) => t.subscribed).map((t) => t.mint);
+      for (let i = 0; i < active.length; i += 100) sendUp({ method: 'subscribeTokenTrade', keys: active.slice(i, i + 100) });
+    }
   });
   up.on('message', (raw) => {
     stats.lastUpstreamMsg = Date.now();
@@ -433,16 +642,19 @@ function connectUpstream() {
       return;
     }
     if (d.txType === 'create') onCreate(d);
-    else if (d.txType === 'buy' || d.txType === 'sell') onTrade(d);
-    else if (stats.otherLogged < 5) {
+    else if (d.txType === 'buy' || d.txType === 'sell') {
+      countTrade();
+      onTrade(d);
+    } else if (stats.otherLogged < 10) {
+      // e.g. error messages from PumpPortal (missing key, no funds) show up here in the Render logs
       stats.otherLogged++;
-      console.log('[upstream] other message:', JSON.stringify(d).slice(0, 200));
+      console.log('[upstream] other message:', JSON.stringify(d).slice(0, 300));
     }
   });
   up.on('error', (e) => console.error('[upstream] error:', e.message));
-  up.on('close', () => {
+  up.on('close', (code, reason) => {
     stats.upstream = 'reconnecting';
-    console.log('[upstream] closed, reconnecting in', upBackoff, 'ms');
+    console.log('[upstream] closed (' + code + ' ' + String(reason || '').slice(0, 100) + '), reconnecting in', upBackoff, 'ms');
     setTimeout(connectUpstream, upBackoff);
     upBackoff = Math.min(upBackoff * 2, 30000);
   });
@@ -451,10 +663,16 @@ function connectUpstream() {
 setInterval(() => {
   // send queued trade subscriptions in batches
   if (!subQueue.size || !up || up.readyState !== WebSocket.OPEN) return;
+  if (!streamWanted()) {
+    subQueue.clear();
+    return;
+  }
   const keys = [...subQueue].slice(0, 200);
   keys.forEach((k) => subQueue.delete(k));
   sendUp({ method: 'subscribeTokenTrade', keys });
 }, 500);
+
+setInterval(rollDay, 30_000);
 
 setInterval(() => {
   // reconnect if the upstream goes silent
@@ -464,16 +682,109 @@ setInterval(() => {
   }
 }, 10000);
 
+// ---------------------------------------------------------------- DEX Screener fallback
+let dexRunning = false;
+let dexBackoffUntil = 0;
+
+function applyExt(t, p, now) {
+  const usd = solPrice.usd;
+  const mcUsd = num(p.marketCap) ?? num(p.fdv);
+  const m5 = { buys: num(p.txns?.m5?.buys) || 0, sells: num(p.txns?.m5?.sells) || 0 };
+  const h1 = { buys: num(p.txns?.h1?.buys) || 0, sells: num(p.txns?.h1?.sells) || 0 };
+  const prevM5 = t.ext ? t.ext.m5.buys + t.ext.m5.sells : 0;
+  t.ext = { at: now, volM5Usd: num(p.volume?.m5) || 0, volH1Usd: num(p.volume?.h1) || 0, m5, h1, chM5: num(p.priceChange?.m5), chH1: num(p.priceChange?.h1) };
+  if (mcUsd > 0 && usd) {
+    t.mcap = mcUsd / usd;
+    if (t.mcap > t.ath) t.ath = t.mcap;
+  }
+  if (typeof p.dexId === 'string' && /^(pumpswap|raydium|meteora|orca)/i.test(p.dexId)) t.gradExt = true;
+  const m5Total = m5.buys + m5.sells;
+  if (m5Total > 0) {
+    t.idleVerified = false;
+    // more trades than last check = fresh activity; otherwise the last trade was somewhere in the last 5 min
+    t.lastTradeAt = m5Total > prevM5 ? now : Math.max(t.lastTradeAt, now - 5 * 60_000);
+  }
+  dirty.add(t.mint);
+  // a coin that starts moving gets its trades streamed again (if a key is set and the cap allows)
+  if (!t.subscribed && ((t.ext.chM5 !== null && t.ext.chM5 >= 20) || m5Total >= 20)) ensureSubscribed(t);
+}
+
+async function dexBatch(batch) {
+  let arr;
+  try {
+    arr = await fetchJson(DEX_URL + '/tokens/v1/solana/' + batch.map((t) => t.mint).join(','), 8000);
+  } catch (e) {
+    if (/429/.test(e.message)) dexBackoffUntil = Date.now() + 60_000;
+    console.warn('[dexscreener] batch failed:', e.name === 'AbortError' ? 'timeout' : e.message);
+    return;
+  }
+  if (!Array.isArray(arr)) return;
+  const now = Date.now();
+  stats.dexOk++;
+  stats.dexLastAt = now;
+  const best = new Map();
+  for (const p of arr) {
+    const m = p?.baseToken?.address;
+    if (!m) continue;
+    const liq = num(p.liquidity?.usd) || 0;
+    const cur = best.get(m);
+    if (!cur || liq > cur.liq) best.set(m, { p, liq });
+  }
+  for (const t of batch) {
+    t.extCheckedAt = now;
+    const hit = best.get(t.mint);
+    if (hit) applyExt(t, hit.p, now);
+  }
+}
+
+async function pollDex() {
+  if (dexRunning || Date.now() < dexBackoffUntil || !solPrice.usd) return;
+  dexRunning = true;
+  try {
+    const now = Date.now();
+    const cands = [];
+    for (const t of tokens.values()) {
+      if (t.subscribed && streamOn()) continue; // trades already streamed
+      if (now - t.createdAt > DEX_MAX_AGE_MS) continue;
+      cands.push(t);
+    }
+    // least recently checked first, newest coins first among equals
+    cands.sort((a, b) => a.extCheckedAt - b.extCheckedAt || b.createdAt - a.createdAt);
+    const picked = cands.slice(0, DEX_BATCH * DEX_BATCHES_PER_CYCLE);
+    const batches = [];
+    for (let i = 0; i < picked.length; i += DEX_BATCH) batches.push(picked.slice(i, i + DEX_BATCH));
+    for (let i = 0; i < batches.length; i += 3) await Promise.all(batches.slice(i, i + 3).map(dexBatch));
+  } finally {
+    dexRunning = false;
+  }
+}
+
 // ---------------------------------------------------------------- housekeeping
 function housekeeping(force = false) {
   const now = Date.now();
+  const watched = new Set();
+  for (const c of clients) for (const m of c.coins) watched.add(m);
   const unsub = [];
-  for (const t of tokens.values()) {
-    if (t.subscribed && now - t.lastTradeAt > UNSUB_AFTER_MS) {
-      t.subscribed = false;
-      unsub.push(t.mint);
+  for (const t of [...tokens.values()]) {
+    if (now - t.createdAt > TOKEN_TTL_MS) {
+      if (t.subscribed) unsub.push(t.mint);
+      removeToken(t);
+      continue;
     }
-    if (now - t.createdAt > TOKEN_TTL_MS) removeToken(t);
+    if (t.subscribed) {
+      // stream trades only for coins that are watched, moving, or young and still trading
+      const idle = now - t.lastTradeAt;
+      const age = now - t.createdAt;
+      const st = t.sum?.status;
+      const keep = watched.has(t.mint) || st === 'moving' || st === 'about_to_graduate' || (idle < IDLE_UNSUB_MS && age < ACTIVE_MAX_AGE_MS);
+      if (!keep) {
+        t.subscribed = false;
+        if (idle >= IDLE_UNSUB_MS && streamOn()) t.idleVerified = true; // we watched it live and it was quiet
+        unsub.push(t.mint);
+      }
+    } else if (watched.has(t.mint)) {
+      ensureSubscribed(t);
+    }
   }
   for (let i = 0; i < unsub.length; i += 100) sendUp({ method: 'unsubscribeTokenTrade', keys: unsub.slice(i, i + 100) });
   if (force || tokens.size > MAX_TOKENS) {
@@ -495,7 +806,7 @@ function removeToken(t) {
   }
 }
 
-setInterval(() => housekeeping(false), 60_000);
+setInterval(() => housekeeping(false), 20_000);
 
 // ---------------------------------------------------------------- push to browsers
 function safeSend(c, obj) {
@@ -590,6 +901,12 @@ function statusObject() {
     clients: clients.size,
     uptimeSec: Math.floor((Date.now() - startedAt) / 1000),
     solPriceStatus: solPrice.status,
+    solPriceSource: solPrice.source,
+    tradeStream: tradeStreamState(),
+    tradesToday: stats.tradesToday,
+    dailyTradeCap: DAILY_TRADE_CAP,
+    streamedCoins: [...tokens.values()].filter((t) => t.subscribed).length,
+    dexLastOkAt: stats.dexLastAt || null,
     serverTime: Date.now(),
   };
 }
@@ -847,6 +1164,7 @@ wss.on('connection', (ws) => {
         const t = tokens.get(m.mint);
         if (!t) return safeSend(c, { type: 'error', message: 'Unknown coin', mint: m.mint });
         c.coins.add(m.mint);
+        ensureSubscribed(t); // coins a visitor is watching get live trades
         safeSend(c, { type: 'coin_snapshot', coin: t.sum, trades: [...t.trades].reverse().slice(0, 50), holders: holdersList(t, 20) });
       }
     } else if (m.type === 'unsubscribe') {
@@ -870,14 +1188,94 @@ setInterval(() => {
   }
 }, 30_000);
 
+// ---------------------------------------------------------------- saved state (history survives restarts if DATA_DIR is a persistent disk)
+const r4 = (x) => (Number.isFinite(x) ? Number(x.toFixed(4)) : 0);
+
+function stateJson() {
+  const list = [...tokens.values()]
+    .sort((a, b) => b.lastTradeAt - a.lastTradeAt)
+    .slice(0, SAVE_MAX_TOKENS)
+    .map((t) => ({
+      mint: t.mint, name: t.name, symbol: t.symbol, uri: t.uri, creator: t.creator, createdAt: t.createdAt,
+      image: t.image, description: t.description, twitter: t.twitter, telegram: t.telegram, website: t.website,
+      metaLive: t.meta.status === 'live', mcap: t.mcap, initialMcap: t.initialMcap, ath: t.ath, vTokens: t.vTokens, vSol: t.vSol,
+      lastTradeAt: t.lastTradeAt, tradeCount: t.tradeCount, creatorMax: t.creatorMax, gradExt: t.gradExt, idleVerified: t.idleVerified,
+      slots: t.slots.slice(-SAVE_MAX_SLOTS).map((x) => [x.k, r4(x.o), r4(x.h), r4(x.l), r4(x.c), x.b, x.s, r4(x.v)]),
+    }));
+  return JSON.stringify({ v: 1, savedAt: Date.now(), day: stats.day, tradesToday: stats.tradesToday, solPrice, tokens: list });
+}
+
+let saving = false;
+async function saveState() {
+  if (saving) return;
+  saving = true;
+  try {
+    const data = stateJson();
+    await fs.promises.mkdir(DATA_DIR, { recursive: true });
+    await fs.promises.writeFile(STATE_FILE + '.tmp', data);
+    await fs.promises.rename(STATE_FILE + '.tmp', STATE_FILE);
+  } catch (e) {
+    console.warn('[state] save failed:', e.message);
+  } finally {
+    saving = false;
+  }
+}
+
+function saveStateSync() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(STATE_FILE + '.tmp', stateJson());
+    fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
+  } catch (e) {
+    console.warn('[state] save failed:', e.message);
+  }
+}
+
+function loadState() {
+  let j;
+  try {
+    j = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+  } catch {
+    console.log('[state] no saved state found, starting empty (' + STATE_FILE + ')');
+    return;
+  }
+  if (!j || j.v !== 1 || !Array.isArray(j.tokens)) return;
+  const now = Date.now();
+  if (j.day === stats.day && Number.isFinite(j.tradesToday)) {
+    stats.tradesToday = j.tradesToday; // so a restart does not reset the daily cost cap
+    if (stats.tradesToday >= DAILY_TRADE_CAP) stats.capped = true;
+  }
+  if (j.solPrice && j.solPrice.usd) solPrice = { ...j.solPrice, status: 'stale', reason: 'Restored from last run, refreshing' };
+  let n = 0;
+  for (const o of j.tokens) {
+    if (!o || !o.mint || tokens.has(o.mint) || now - o.createdAt > TOKEN_TTL_MS) continue;
+    o.slots = (o.slots || []).map((a) => ({ k: a[0], o: a[1], h: a[2], l: a[3], c: a[4], b: a[5], s: a[6], v: a[7] }));
+    const t = makeToken(o, now);
+    registerToken(t);
+    t.sum = buildSummary(t, now);
+    if (t.uri && !o.metaLive) enqueueMeta(t);
+    if (streamWanted() && now - t.lastTradeAt < IDLE_UNSUB_MS && now - t.createdAt < ACTIVE_MAX_AGE_MS) ensureSubscribed(t);
+    n++;
+  }
+  console.log('[state] restored ' + n + ' coins from ' + new Date(j.savedAt).toISOString() + ' (holders and trade lists start empty after a restart)');
+}
+
 // ---------------------------------------------------------------- start
+loadState();
 server.listen(PORT, () => console.log('[server] listening on port', PORT));
+console.log('[config] trade stream: ' + tradeStreamState() + ', daily cap ' + DAILY_TRADE_CAP + ', key ' + (API_KEY ? 'set' : 'NOT set') + ', state file ' + STATE_FILE);
 connectUpstream();
 pollSolPrice();
 setInterval(pollSolPrice, 30_000);
+setTimeout(() => {
+  pollDex();
+  setInterval(pollDex, DEX_POLL_MS);
+}, 5000);
+setInterval(saveState, SAVE_MS);
 
 function shutdown() {
   console.log('[server] shutting down');
+  saveStateSync();
   try {
     up && up.close();
   } catch {}
